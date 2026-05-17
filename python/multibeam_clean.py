@@ -89,6 +89,17 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# threadpoolctl is a thin pure-Python lib that lets us cap BLAS thread pools
+# *inside a context manager*. Conda/pip numpy stacks ship it as a transitive
+# dep almost universally. Soft import: if missing, we just don't parallelize
+# BLAS-heavy work (parallel workers would oversubscribe).
+try:
+    from threadpoolctl import threadpool_limits as _threadpool_limits
+    _HAS_TPCTL = True
+except Exception:
+    _threadpool_limits = None
+    _HAS_TPCTL = False
+
 
 # ==========================================================================
 # SIGPROC header I/O (preserves field order so the writer round-trips)
@@ -347,6 +358,55 @@ def _beam_stats_mad(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return med.astype(np.float32), sigma.astype(np.float32)
 
 
+def _beam_stats_plain(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Plain per-channel mean + std (axis=1). Cheapest option; not robust to
+    outliers, but for cleaning across beams the eigen analysis only needs
+    consistency, not absolute correctness."""
+    mu = x.mean(axis=1)
+    sigma = x.std(axis=1)
+    return mu.astype(np.float32), np.maximum(sigma, 1e-3).astype(np.float32)
+
+
+# ==========================================================================
+# Parallel helpers (memory-bound numpy ufuncs are single-threaded by default,
+# which is the single biggest perf footgun on large-chunk multi-core nodes).
+# ==========================================================================
+
+def _split_workload(n: int, n_workers: int) -> List[Tuple[int, int]]:
+    """Return list of (start, stop) index ranges covering [0, n)."""
+    if n_workers <= 1 or n <= 1:
+        return [(0, n)]
+    parts = np.array_split(np.arange(n), min(n_workers, n))
+    return [(int(p[0]), int(p[-1]) + 1) for p in parts if len(p)]
+
+
+def _parallel_whiten(chunk: np.ndarray, mean: np.ndarray, sigma: np.ndarray,
+                     pool: ThreadPoolExecutor, n_workers: int) -> None:
+    """In place: chunk = (chunk - mean[..., None]) / sigma[..., None]
+    parallelized across the leading (beam) axis."""
+    ranges = _split_workload(chunk.shape[0], n_workers)
+    def _work(rng):
+        i0, i1 = rng
+        chunk[i0:i1] -= mean[i0:i1, :, None]
+        chunk[i0:i1] /= sigma[i0:i1, :, None]
+    if len(ranges) == 1:
+        _work(ranges[0]); return
+    list(pool.map(_work, ranges))
+
+
+def _parallel_dewhiten(chunk: np.ndarray, mean: np.ndarray, sigma: np.ndarray,
+                       pool: ThreadPoolExecutor, n_workers: int) -> None:
+    """Inverse of _parallel_whiten."""
+    ranges = _split_workload(chunk.shape[0], n_workers)
+    def _work(rng):
+        i0, i1 = rng
+        chunk[i0:i1] *= sigma[i0:i1, :, None]
+        chunk[i0:i1] += mean[i0:i1, :, None]
+    if len(ranges) == 1:
+        _work(ranges[0]); return
+    list(pool.map(_work, ranges))
+
+
 # ==========================================================================
 # Eigen-cleaning kernel (in-place, freq-batch streaming)
 # ==========================================================================
@@ -359,6 +419,7 @@ class CleanParams:
     safety: float
     max_rank: int
     freq_batch_tiles: int = 8     # number of freq tiles to batch per einsum
+    prefilter: bool = True        # skip eigh on tiles that can't possibly host RFI
 
 
 @dataclass
@@ -366,22 +427,111 @@ class CleanDiag:
     n_tiles: int = 0
     n_rfi_eigvals: int = 0
     n_tiles_with_rfi: int = 0
+    n_tiles_skipped: int = 0     # passed pre-filter, no eigh done
     max_eigval: float = 0.0
     mp_edge: float = 0.0
     safety_threshold: float = 0.0
+    t_cov: float = 0.0
+    t_eigh: float = 0.0
+    t_project: float = 0.0
+    t_reshape: float = 0.0
 
 
-def clean_chunk(whitened: np.ndarray, params: CleanParams) -> CleanDiag:
+def _clean_one_batch(whitened, c0, c1, nFb, Fw, nTt, Tw, B, N,
+                     threshold, mr, min_support, prefilter, tr_skip,
+                     timers):
+    """Clean a single freq-tile batch in place inside `whitened`.
+    Returns (n_rfi_eigvals, n_tiles_with_rfi, n_tiles_skipped, max_eigval)."""
+    t0 = time.perf_counter()
+    view = whitened[:, c0:c1, :nTt * Tw]
+    tiles = np.ascontiguousarray(
+        view.reshape(B, nFb, Fw, nTt, Tw)
+            .transpose(1, 3, 0, 2, 4)
+            .reshape(nFb, nTt, B, N)
+    )
+    timers["reshape"] += time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    cov = tiles @ tiles.swapaxes(-2, -1)
+    cov *= (1.0 / float(N))
+    timers["cov"] += time.perf_counter() - t0
+
+    if prefilter:
+        tr = np.einsum("FTbb->FT", cov)
+        active = tr > tr_skip
+    else:
+        active = np.ones((nFb, nTt), dtype=bool)
+
+    n_active = int(active.sum())
+    n_total = nFb * nTt
+
+    if n_active == 0:
+        t0 = time.perf_counter()
+        whitened[:, c0:c1, :nTt * Tw] = (
+            tiles.reshape(nFb, nTt, B, Fw, Tw)
+                 .transpose(2, 0, 3, 1, 4)
+                 .reshape(B, nFb * Fw, nTt * Tw)
+        )
+        timers["reshape"] += time.perf_counter() - t0
+        return (0, 0, n_total, 0.0)
+
+    idx_active = np.argwhere(active)
+    cov_active = cov[active]
+    t0 = time.perf_counter()
+    eigvals_a, eigvecs_a = np.linalg.eigh(cov_active)
+    timers["eigh"] += time.perf_counter() - t0
+
+    eigvals_a = eigvals_a[..., ::-1]
+    eigvecs_a = eigvecs_a[..., ::-1]
+    top_eigvals = eigvals_a[..., :mr]
+    top_eigvecs = eigvecs_a[..., :, :mr]
+
+    significant = top_eigvals > threshold
+    u_sq = top_eigvecs * top_eigvecs
+    u4_sum = (u_sq * u_sq).sum(axis=-2)
+    pr = 1.0 / np.maximum(u4_sum, 1e-30)
+    enough_support = pr >= float(min_support)
+    is_rfi = significant & enough_support
+
+    max_eigval = float(top_eigvals[..., 0].max()) if top_eigvals.size else 0.0
+    rfi_per_tile = is_rfi.any(axis=-1)
+    n_rfi_here = int(is_rfi.sum())
+    n_tiles_rfi = int(rfi_per_tile.sum())
+    n_skipped = n_total - n_active
+
+    if n_rfi_here:
+        sub_mask = rfi_per_tile
+        sub_top_eigvecs = top_eigvecs[sub_mask]
+        sub_is_rfi = is_rfi[sub_mask]
+        sub_idx = idx_active[sub_mask]
+        U_rfi = sub_top_eigvecs * sub_is_rfi[..., None, :].astype(np.float32)
+        sub_tiles = tiles[sub_idx[:, 0], sub_idx[:, 1]]
+        t0 = time.perf_counter()
+        v = U_rfi.swapaxes(-2, -1) @ sub_tiles
+        sub_tiles -= U_rfi @ v
+        timers["project"] += time.perf_counter() - t0
+        tiles[sub_idx[:, 0], sub_idx[:, 1]] = sub_tiles
+
+    t0 = time.perf_counter()
+    whitened[:, c0:c1, :nTt * Tw] = (
+        tiles.reshape(nFb, nTt, B, Fw, Tw)
+             .transpose(2, 0, 3, 1, 4)
+             .reshape(B, nFb * Fw, nTt * Tw)
+    )
+    timers["reshape"] += time.perf_counter() - t0
+    return (n_rfi_here, n_tiles_rfi, n_skipped, max_eigval)
+
+
+def clean_chunk(whitened: np.ndarray, params: CleanParams,
+                pool: Optional[ThreadPoolExecutor] = None,
+                n_workers: int = 1) -> CleanDiag:
     """
     In-place clean of a whitened (B, C, T) chunk.
 
-    Per (time tile, freq tile) of size (Tw, Fw): form BxB cross-beam
-    covariance, eigendecompose, identify RFI eigenvectors that pass both
-    the Marchenko-Pastur threshold AND the participation-ratio gate,
-    subtract the U_rfi U_rfi^T projection of the data in place.
-
-    Returns diagnostics. Edge frequency/time samples that don't fit a
-    full tile are passed through untouched.
+    If `pool` is provided and n_workers > 1, freq-tile batches are processed
+    in parallel; the gather/scatter reshapes (which dominate wall time on
+    large chunks) parallelize cleanly because batches touch disjoint slices
+    of `whitened`.
     """
     B, C, T = whitened.shape
     Fw = max(1, int(params.tile_freq_chans))
@@ -401,88 +551,73 @@ def clean_chunk(whitened: np.ndarray, params: CleanParams) -> CleanDiag:
     threshold = mp_edge * params.safety
     mr = params.max_rank if params.max_rank > 0 else B
     mr = min(mr, B)
-
     fbatch = max(1, int(params.freq_batch_tiles))
+    tr_skip = threshold + (B - 1)
 
-    total_rfi = 0
-    total_rfi_tiles = 0
-    total_tiles = 0
-    max_eigval = 0.0
-
+    # Build the work list of (f0, f1) batches.
+    batches = []
     for f0 in range(0, nFt, fbatch):
         f1 = min(f0 + fbatch, nFt)
-        nFb = f1 - f0
-        c0 = f0 * Fw
-        c1 = f1 * Fw
+        batches.append((f0, f1))
 
-        # Reshape the whitened slice into (nFb, nTt, B, N). This forces a
-        # contiguous copy of size nFb*nTt*B*N*4 bytes (~tens of MB for
-        # fbatch=8).
-        view = whitened[:, c0:c1, :T_use]
-        tiles = np.ascontiguousarray(
-            view.reshape(B, nFb, Fw, nTt, Tw)
-                .transpose(1, 3, 0, 2, 4)
-                .reshape(nFb, nTt, B, N)
-        )
+    timers = {"reshape": 0.0, "cov": 0.0, "eigh": 0.0, "project": 0.0}
 
-        # Cross-beam covariance: (nFb, nTt, B, B). Single batched matmul.
-        cov = tiles @ tiles.swapaxes(-2, -1)
-        cov *= (1.0 / float(N))
+    # Parallel path: each worker handles one freq-tile batch with BLAS locked
+    # to a single thread so the 20-way worker pool doesn't oversubscribe
+    # against MKL's internal 20-thread BLAS pool. Memory-bound reshapes
+    # parallelize linearly; small BLAS calls (per-tile project) are also
+    # better in many-1-thread mode than few-many-thread mode.
+    use_parallel = (pool is not None and n_workers > 1 and len(batches) > 1
+                    and _HAS_TPCTL)
 
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        # descending: largest eigenvalues first
-        eigvals = eigvals[..., ::-1]
-        eigvecs = eigvecs[..., ::-1]
+    if use_parallel:
+        thread_timers: List[Dict[str, float]] = [
+            {"reshape": 0.0, "cov": 0.0, "eigh": 0.0, "project": 0.0}
+            for _ in batches
+        ]
+        def _do(args):
+            i, (f0, f1) = args
+            nFb = f1 - f0
+            with _threadpool_limits(limits=1):
+                return _clean_one_batch(
+                    whitened, f0 * Fw, f1 * Fw,
+                    nFb, Fw, nTt, Tw, B, N,
+                    threshold, mr, params.min_support,
+                    params.prefilter, tr_skip,
+                    thread_timers[i],
+                )
+        results = list(pool.map(_do, list(enumerate(batches))))
+        for tt in thread_timers:
+            for k in timers: timers[k] += tt[k]
+    else:
+        results = []
+        for (f0, f1) in batches:
+            nFb = f1 - f0
+            results.append(_clean_one_batch(
+                whitened, f0 * Fw, f1 * Fw,
+                nFb, Fw, nTt, Tw, B, N,
+                threshold, mr, params.min_support,
+                params.prefilter, tr_skip,
+                timers,
+            ))
 
-        # Only consider the top mr eigenpairs (RFI sits at the top).
-        top_eigvals = eigvals[..., :mr]               # (nFb, nTt, mr)
-        top_eigvecs = eigvecs[..., :, :mr]            # (nFb, nTt, B, mr)
-
-        # MP edge gate
-        significant = top_eigvals > threshold
-
-        # Participation ratio: P = 1 / sum_b u_b^4. >= min_support is "RFI
-        # spreads across at least N beams".
-        u_sq = top_eigvecs * top_eigvecs
-        u4_sum = (u_sq * u_sq).sum(axis=-2)           # (nFb, nTt, mr)
-        pr = 1.0 / np.maximum(u4_sum, 1e-30)
-        enough_support = pr >= float(params.min_support)
-
-        is_rfi = significant & enough_support
-
-        # Diagnostics
-        total_tiles += nFb * nTt
-        n_rfi_here = int(is_rfi.sum())
-        total_rfi += n_rfi_here
-        if top_eigvals.size:
-            max_eigval = max(max_eigval, float(top_eigvals[..., 0].max()))
-        if n_rfi_here:
-            total_rfi_tiles += int(is_rfi.any(axis=-1).sum())
-
-        if n_rfi_here:
-            # U_rfi: top_eigvecs with non-RFI columns zeroed.
-            U_rfi = top_eigvecs * is_rfi[..., None, :].astype(np.float32)
-            # v = U_rfi^T @ tiles    (nFb, nTt, mr, N), small in mr
-            v = U_rfi.swapaxes(-2, -1) @ tiles
-            # tiles -= U_rfi @ v
-            tiles -= U_rfi @ v
-            # Free the scratch eagerly
-            del U_rfi, v
-
-        # Write the (possibly modified) tiles back into whitened.
-        whitened[:, c0:c1, :T_use] = (
-            tiles.reshape(nFb, nTt, B, Fw, Tw)
-                 .transpose(2, 0, 3, 1, 4)
-                 .reshape(B, nFb * Fw, T_use)
-        )
-        del tiles, cov, eigvals, eigvecs, top_eigvals, top_eigvecs
+    total_rfi = sum(r[0] for r in results)
+    total_rfi_tiles = sum(r[1] for r in results)
+    n_skipped = sum(r[2] for r in results)
+    max_eigval = max((r[3] for r in results), default=0.0)
+    total_tiles = sum((f1 - f0) for f0, f1 in batches) * nTt
 
     diag.n_tiles = total_tiles
     diag.n_rfi_eigvals = total_rfi
     diag.n_tiles_with_rfi = total_rfi_tiles
+    diag.n_tiles_skipped = n_skipped
     diag.max_eigval = max_eigval
     diag.mp_edge = mp_edge
     diag.safety_threshold = threshold
+    diag.t_cov = timers["cov"]
+    diag.t_eigh = timers["eigh"]
+    diag.t_project = timers["project"]
+    diag.t_reshape = timers["reshape"]
     return diag
 
 
@@ -580,6 +715,65 @@ class PipelineParams:
     cores: int
     freq_batch_tiles: int
     robust_stats: str          # 'trimmed' (default) or 'mad'
+    prefilter: bool = True     # cheap trace-based skip on RFI-free tiles
+
+
+# ----- threading / environment introspection -----
+
+def _affinity_cpus() -> Optional[int]:
+    try:
+        return len(os.sched_getaffinity(0))         # Linux: cgroup-aware
+    except Exception:
+        return None
+
+
+def _threading_banner(requested_cores: int) -> List[str]:
+    lines: List[str] = []
+    aff = _affinity_cpus()
+    lines.append(f"[env] python={sys.version.split()[0]}  numpy={np.__version__}")
+    lines.append(f"[env] requested cores       : {requested_cores}")
+    lines.append(f"[env] OMP_NUM_THREADS       : {os.environ.get('OMP_NUM_THREADS', '<unset>')}")
+    lines.append(f"[env] MKL_NUM_THREADS       : {os.environ.get('MKL_NUM_THREADS', '<unset>')}")
+    lines.append(f"[env] OPENBLAS_NUM_THREADS  : {os.environ.get('OPENBLAS_NUM_THREADS', '<unset>')}")
+    lines.append(f"[env] os.cpu_count()        : {os.cpu_count()}")
+    lines.append(f"[env] cgroup affinity CPUs  : {aff if aff is not None else 'n/a'}")
+    if aff is not None and aff < requested_cores:
+        lines.append(f"[env] WARNING: only {aff} CPU(s) actually granted by the kernel "
+                     f"(you asked for {requested_cores}). BLAS will be limited.")
+    lines.append(f"[env] threadpoolctl available: {_HAS_TPCTL}   "
+                 f"(needed for the parallel clean_chunk path)")
+    # Try a tiny GEMM and time it to confirm BLAS is actually threaded
+    try:
+        n = 1024
+        A = np.random.randn(n, n).astype(np.float32)
+        B = np.random.randn(n, n).astype(np.float32)
+        # warmup
+        _ = A @ B
+        t0 = time.monotonic()
+        for _ in range(3): _ = A @ B
+        dt = (time.monotonic() - t0) / 3.0
+        gflops = (2.0 * n * n * n) / dt / 1e9
+        lines.append(f"[env] sgemm({n}x{n}) GFLOPS  : {gflops:7.1f}   "
+                     f"({dt*1000:.1f} ms/call;  threaded BLAS should give "
+                     f">>{20*requested_cores} GFLOPS)")
+    except Exception as e:
+        lines.append(f"[env] BLAS micro-benchmark failed: {e}")
+    # Try a small eigh to see if LAPACK is multi-threaded
+    try:
+        n = 256
+        S = np.random.randn(n, n).astype(np.float32)
+        S = S @ S.T
+        # warmup
+        _ = np.linalg.eigh(S)
+        t0 = time.monotonic()
+        for _ in range(3): _ = np.linalg.eigh(S)
+        dt = (time.monotonic() - t0) / 3.0
+        lines.append(f"[env] eigh({n}x{n})           : {dt*1000:7.1f} ms/call   "
+                     f"(if this is the same as 1-core LAPACK, your numpy is "
+                     f"using netlib LAPACK)")
+    except Exception as e:
+        lines.append(f"[env] eigh micro-benchmark failed: {e}")
+    return lines
 
 
 def process(beams: List[BeamFile], params: PipelineParams,
@@ -617,11 +811,19 @@ def process(beams: List[BeamFile], params: PipelineParams,
         safety = params.safety,
         max_rank = params.max_rank,
         freq_batch_tiles = params.freq_batch_tiles,
+        prefilter = params.prefilter,
     )
 
-    stats_fn = _beam_stats_mad if params.robust_stats == "mad" else _beam_stats_trimmed
+    if params.robust_stats == "mad":
+        stats_fn = _beam_stats_mad
+    elif params.robust_stats == "trimmed":
+        stats_fn = _beam_stats_trimmed
+    else:
+        stats_fn = _beam_stats_plain
 
     if not quiet:
+        for line in _threading_banner(params.cores):
+            print(line)
         chunk_gb = (B * nchans * chunk_samps * 4) / (1 << 30)
         print(f"[multibeam_clean] beams={B}  nchans={nchans}  nbits={nbits}  "
               f"tsamp={tsamp*1e6:.3f} us")
@@ -656,13 +858,20 @@ def process(beams: List[BeamFile], params: PipelineParams,
     total_rfi = 0
     total_rfi_tiles = 0
     total_tiles = 0
+    # Per-stage cumulative timers (reset every progress report)
+    t_acc = {"read": 0.0, "unpack": 0.0, "stats": 0.0, "whiten": 0.0,
+             "clean": 0.0, "dewhiten": 0.0, "pack": 0.0, "write": 0.0,
+             "cov": 0.0, "eigh": 0.0, "project": 0.0, "reshape": 0.0}
+    chunks_since_report = 0
 
     try:
         for ck in range(n_chunks):
             # --- 1. Read packed bytes per beam (parallel) ---
+            ts = time.perf_counter()
             def _read(b):
                 return b.fp_in.read(bytes_per_chunk)
             packed_list = list(io_pool.map(_read, beams))
+            t_acc["read"] += time.perf_counter() - ts
             if any(len(p) != bytes_per_chunk for p in packed_list):
                 if not quiet:
                     print(f"[multibeam_clean] short read at chunk {ck}, stopping",
@@ -670,21 +879,17 @@ def process(beams: List[BeamFile], params: PipelineParams,
                 break
 
             # --- 2. Unpack into the per-beam slice of `chunk` (parallel).
-            # Each thread allocates a (chunk_samps * nchans) float32 scratch
-            # for the unpacked SIGPROC-order samples, then transposes into
-            # chunk[bi]. Concurrent peak = (cores * 4 * chunk_samps * nchans).
+            ts = time.perf_counter()
             def _unpack(arg):
                 idx, packed = arg
                 arr = np.frombuffer(packed, dtype=np.uint8)
                 flat = unpack_bits_to_float32(arr, nbits, chunk_samps * nchans)
-                # SIGPROC layout is time-major over chans: (T, C); we want
-                # (C, T) in our chunk buffer.
                 chunk[idx, :, :] = flat.reshape(chunk_samps, nchans).T
             list(io_pool.map(_unpack, list(enumerate(packed_list))))
+            t_acc["unpack"] += time.perf_counter() - ts
 
-            # --- 3. Whitening stats per beam (parallel). Each thread owns
-            #        one beam, computes (mean, sigma) per channel, then we
-            #        EMA-update the global state.
+            # --- 3. Whitening stats per beam (parallel).
+            ts = time.perf_counter()
             stats_out = [None] * B
             def _stats(bi):
                 m, s = stats_fn(chunk[bi])
@@ -699,34 +904,50 @@ def process(beams: List[BeamFile], params: PipelineParams,
                     state_mean[bi]  = (1.0 - alpha) * state_mean[bi]  + alpha * m
                     state_sigma[bi] = (1.0 - alpha) * state_sigma[bi] + alpha * s
             state_init = True
-            # Guard against zero sigma
             np.maximum(state_sigma, 1e-3, out=state_sigma)
+            t_acc["stats"] += time.perf_counter() - ts
 
-            # --- 4. Whiten in place: chunk -= mean; chunk /= sigma.
-            chunk -= state_mean[..., None]
-            chunk /= state_sigma[..., None]
+            # --- 4. Whiten in place (parallel across beams).
+            ts = time.perf_counter()
+            _parallel_whiten(chunk, state_mean, state_sigma, io_pool, params.cores)
+            t_acc["whiten"] += time.perf_counter() - ts
 
-            # --- 5. Eigen-clean in place.
-            diag = clean_chunk(chunk, clean_params)
+            # --- 5. Eigen-clean in place (parallel freq batches).
+            ts = time.perf_counter()
+            diag = clean_chunk(chunk, clean_params,
+                               pool=io_pool, n_workers=params.cores)
+            t_acc["clean"]   += time.perf_counter() - ts
+            t_acc["cov"]     += diag.t_cov
+            t_acc["eigh"]    += diag.t_eigh
+            t_acc["project"] += diag.t_project
+            t_acc["reshape"] += diag.t_reshape
 
             total_rfi      += diag.n_rfi_eigvals
             total_rfi_tiles += diag.n_tiles_with_rfi
             total_tiles    += diag.n_tiles
 
-            # --- 6. De-whiten in place: chunk *= sigma; chunk += mean.
-            chunk *= state_sigma[..., None]
-            chunk += state_mean[..., None]
+            # --- 6. De-whiten in place (parallel).
+            ts = time.perf_counter()
+            _parallel_dewhiten(chunk, state_mean, state_sigma, io_pool, params.cores)
+            t_acc["dewhiten"] += time.perf_counter() - ts
 
             # --- 7. Per-beam re-quantize + pack + write (parallel).
-            def _pack_write(arg):
-                idx, b = arg
-                beam = chunk[idx]                   # (C, T)
-                # Transpose to SIGPROC time-major order; this is a copy.
+            packed_outs: List[Optional[np.ndarray]] = [None] * B
+            ts = time.perf_counter()
+            def _pack(idx):
+                beam = chunk[idx]
                 samples = np.ascontiguousarray(beam.T).reshape(-1)
-                packed = pack_float32_to_bits(samples, out_nbits)
-                b.fp_out.write(packed.tobytes())
-            list(io_pool.map(_pack_write,
-                              [(i, b) for i, b in enumerate(beams)]))
+                packed_outs[idx] = pack_float32_to_bits(samples, out_nbits)
+            list(io_pool.map(_pack, range(B)))
+            t_acc["pack"] += time.perf_counter() - ts
+
+            ts = time.perf_counter()
+            def _write(idx):
+                beams[idx].fp_out.write(packed_outs[idx].tobytes())
+            list(io_pool.map(_write, range(B)))
+            t_acc["write"] += time.perf_counter() - ts
+
+            chunks_since_report += 1
 
             # --- 8. Diagnostics + progress ---
             if diag_fp is not None:
@@ -734,6 +955,7 @@ def process(beams: List[BeamFile], params: PipelineParams,
                     "chunk": ck,
                     "t_sec": ck * chunk_samps * tsamp,
                     "n_tiles": diag.n_tiles,
+                    "n_tiles_skipped": diag.n_tiles_skipped,
                     "n_rfi_eigvals": diag.n_rfi_eigvals,
                     "n_tiles_with_rfi": diag.n_tiles_with_rfi,
                     "max_eigval": diag.max_eigval,
@@ -747,11 +969,25 @@ def process(beams: List[BeamFile], params: PipelineParams,
                 elapsed = now - t0
                 eta = elapsed * (1.0 / max(done, 1e-9) - 1.0)
                 tiles_rfi_pct = 100.0 * diag.n_tiles_with_rfi / max(1, diag.n_tiles)
+                tiles_skip_pct = 100.0 * diag.n_tiles_skipped / max(1, diag.n_tiles)
                 print(f"  chunk {ck+1:6d}/{n_chunks}  "
                       f"{100*done:5.1f}%  elapsed {elapsed/60:6.1f} min  "
                       f"ETA {eta/60:6.1f} min  "
-                      f"tiles_with_rfi {tiles_rfi_pct:5.1f}%  "
-                      f"max_lambda={diag.max_eigval:6.2f}", flush=True)
+                      f"skipped {tiles_skip_pct:5.1f}%  "
+                      f"rfi {tiles_rfi_pct:5.1f}%  "
+                      f"max_lam={diag.max_eigval:6.2f}", flush=True)
+                # Per-stage timing breakdown, averaged since last report
+                n = max(1, chunks_since_report)
+                stages = ", ".join(f"{k}={t_acc[k]/n*1e3:6.1f}ms"
+                                   for k in ("read", "unpack", "stats", "whiten",
+                                             "clean", "dewhiten", "pack", "write"))
+                substages = ", ".join(f"{k}={t_acc[k]/n*1e3:6.1f}ms"
+                                      for k in ("cov", "eigh", "project", "reshape"))
+                print(f"    per-chunk avg: {stages}", flush=True)
+                print(f"    clean sub    : {substages}", flush=True)
+                for k in t_acc:
+                    t_acc[k] = 0.0
+                chunks_since_report = 0
                 last_report = now
     finally:
         io_pool.shutdown(wait=True)
@@ -772,6 +1008,138 @@ def process(beams: List[BeamFile], params: PipelineParams,
         "total_tiles_with_rfi": total_rfi_tiles,
         "elapsed_sec": time.monotonic() - t0,
     }
+
+
+# ==========================================================================
+# Benchmark mode: pure compute, no IO
+# ==========================================================================
+
+def _run_benchmark(beams: List[BeamFile], params: PipelineParams,
+                   quiet: bool = False) -> int:
+    """
+    Run the in-memory compute path (unpack -> stats -> whiten -> clean ->
+    de-whiten -> pack) for N_BENCH chunks on synthetic data, with no file
+    IO whatsoever. Reports per-stage timing so cluster users can see whether
+    they're CPU-bound or IO-bound.
+    """
+    nchans = beams[0].header.get("nchans")
+    nbits  = beams[0].header.get("nbits")
+    tsamp  = float(beams[0].header.get("tsamp"))
+    B = len(beams)
+    out_nbits = params.out_nbits if params.out_nbits is not None else nbits
+
+    chunk_samps = int(round(params.chunk_sec / tsamp))
+    tile_time_samps = max(1, int(round(params.tile_time_ms * 1e-3 / tsamp)))
+    if chunk_samps % tile_time_samps:
+        chunk_samps = (chunk_samps // tile_time_samps) * tile_time_samps
+    chunk_samps = max(chunk_samps, tile_time_samps)
+    if (chunk_samps * nchans * nbits) % 8 != 0:
+        chunk_samps = ((chunk_samps * nchans * nbits + 7) // 8 * 8) // (nchans * nbits)
+
+    bytes_per_chunk = (chunk_samps * nchans * nbits) // 8
+    n_bench = 4   # run 4 chunks
+
+    for line in _threading_banner(params.cores):
+        print(line)
+    print(f"[bench] B={B} nchans={nchans} nbits={nbits} tsamp={tsamp*1e6:.2f}us")
+    print(f"[bench] chunk_samps={chunk_samps} ({chunk_samps*tsamp:.3f}s)")
+    print(f"[bench] chunk buffer = {B*nchans*chunk_samps*4/(1<<30):.2f} GB float32")
+
+    # Pre-allocate everything as the real pipeline would.
+    chunk = np.empty((B, nchans, chunk_samps), dtype=np.float32)
+    state_mean  = np.zeros((B, nchans), dtype=np.float32)
+    state_sigma = np.ones ((B, nchans), dtype=np.float32)
+
+    clean_params = CleanParams(
+        tile_time_samp = tile_time_samps,
+        tile_freq_chans = max(1, params.tile_freq_chans),
+        min_support = params.min_support,
+        safety = params.safety,
+        max_rank = params.max_rank,
+        freq_batch_tiles = params.freq_batch_tiles,
+        prefilter = params.prefilter,
+    )
+    if params.robust_stats == "mad":
+        stats_fn = _beam_stats_mad
+    elif params.robust_stats == "trimmed":
+        stats_fn = _beam_stats_trimmed
+    else:
+        stats_fn = _beam_stats_plain
+    io_pool = ThreadPoolExecutor(max_workers=min(B, max(2, params.cores)))
+
+    rng = np.random.default_rng(0)
+    # synthetic packed bytes once, reuse
+    packed_one = rng.integers(0, 256, size=bytes_per_chunk, dtype=np.uint8).tobytes()
+    packed_list = [packed_one for _ in range(B)]
+
+    t_acc = {"unpack": 0.0, "stats": 0.0, "whiten": 0.0,
+             "clean": 0.0, "dewhiten": 0.0, "pack": 0.0,
+             "cov": 0.0, "eigh": 0.0, "project": 0.0, "reshape": 0.0}
+    t_total = 0.0
+    for ck in range(n_bench):
+        t_chunk = time.perf_counter()
+
+        ts = time.perf_counter()
+        def _unpack(arg):
+            idx, packed = arg
+            arr = np.frombuffer(packed, dtype=np.uint8)
+            flat = unpack_bits_to_float32(arr, nbits, chunk_samps * nchans)
+            chunk[idx, :, :] = flat.reshape(chunk_samps, nchans).T
+        list(io_pool.map(_unpack, list(enumerate(packed_list))))
+        t_acc["unpack"] += time.perf_counter() - ts
+
+        ts = time.perf_counter()
+        stats_out = [None] * B
+        def _stats(bi):
+            m, s = stats_fn(chunk[bi]); stats_out[bi] = (m, s)
+        list(io_pool.map(_stats, range(B)))
+        for bi in range(B):
+            m, s = stats_out[bi]
+            if ck == 0:
+                state_mean[bi]  = m
+                state_sigma[bi] = s
+        np.maximum(state_sigma, 1e-3, out=state_sigma)
+        t_acc["stats"] += time.perf_counter() - ts
+
+        ts = time.perf_counter()
+        _parallel_whiten(chunk, state_mean, state_sigma, io_pool, params.cores)
+        t_acc["whiten"] += time.perf_counter() - ts
+
+        ts = time.perf_counter()
+        diag = clean_chunk(chunk, clean_params,
+                           pool=io_pool, n_workers=params.cores)
+        t_acc["clean"]   += time.perf_counter() - ts
+        t_acc["cov"]     += diag.t_cov
+        t_acc["eigh"]    += diag.t_eigh
+        t_acc["project"] += diag.t_project
+        t_acc["reshape"] += diag.t_reshape
+
+        ts = time.perf_counter()
+        _parallel_dewhiten(chunk, state_mean, state_sigma, io_pool, params.cores)
+        t_acc["dewhiten"] += time.perf_counter() - ts
+
+        ts = time.perf_counter()
+        def _pack(idx):
+            beam = chunk[idx]
+            samples = np.ascontiguousarray(beam.T).reshape(-1)
+            return pack_float32_to_bits(samples, out_nbits)
+        list(io_pool.map(_pack, range(B)))
+        t_acc["pack"] += time.perf_counter() - ts
+
+        chunk_elapsed = time.perf_counter() - t_chunk
+        t_total += chunk_elapsed
+        print(f"[bench] chunk {ck+1}/{n_bench}: {chunk_elapsed*1000:.1f} ms  "
+              f"(skipped {100.0*diag.n_tiles_skipped/max(1,diag.n_tiles):.1f}% of tiles)",
+              flush=True)
+
+    io_pool.shutdown(wait=True)
+    print(f"\n[bench] per-chunk stage averages ({n_bench} chunks):")
+    for k, v in t_acc.items():
+        print(f"  {k:10s}: {v/n_bench*1000:7.1f} ms")
+    print(f"  TOTAL     : {t_total/n_bench*1000:7.1f} ms")
+    rt = (n_bench * chunk_samps * tsamp) / t_total
+    print(f"\n[bench] pure-compute throughput: {rt:.2f}x real-time on {params.cores} cores")
+    return 0
 
 
 # ==========================================================================
@@ -811,17 +1179,29 @@ def main(argv=None) -> int:
                    help="multiplicative safety factor on MP edge (default: 1.10)")
     p.add_argument("--max-rank", type=int, default=5,
                    help="cap on # eigenvectors subtracted per tile (default: 5)")
-    p.add_argument("--robust-stats", choices=("trimmed", "mad"),
-                   default="trimmed",
+    p.add_argument("--robust-stats", choices=("none", "trimmed", "mad"),
+                   default="none",
                    help="per-beam, per-channel whitening estimator. "
-                        "'trimmed' (default) is GIL-friendly and ~10x cheaper; "
-                        "'mad' is the textbook MAD but slower & more memory.")
+                        "'none' (default) is plain mean/std, cheapest. "
+                        "'trimmed' iteratively sigma-clips. "
+                        "'mad' is textbook MAD but heaviest. "
+                        "The eigen analysis only needs whitening to be "
+                        "consistent across beams, so 'none' is usually fine.")
+    p.add_argument("--no-prefilter", action="store_true",
+                   help="disable the cheap trace-based pre-filter that skips "
+                        "tiles which cannot possibly host an RFI eigenvalue. "
+                        "Pre-filter avoids ~99%% of eigh calls on typical data.")
     p.add_argument("--tstart-tol-sec", type=float, default=1e-3,
                    help="tolerance on tstart agreement across beams (default: 1 ms)")
     p.add_argument("--diag", type=Path, default=None,
                    help="optional path for per-chunk JSON-lines diagnostics")
     p.add_argument("--dry-run", action="store_true",
                    help="parse headers, validate compatibility, print plan and exit")
+    p.add_argument("--benchmark", action="store_true",
+                   help="ignore input files; generate B=72 (or len(inputs)) "
+                        "synthetic beams in RAM and run a 4-second smoke through "
+                        "the pipeline to time pure compute. Useful for "
+                        "diagnosing slow IO vs slow BLAS on a cluster node.")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -858,7 +1238,11 @@ def main(argv=None) -> int:
         cores = args.cores,
         freq_batch_tiles = args.freq_batch_tiles,
         robust_stats = args.robust_stats,
+        prefilter = not args.no_prefilter,
     )
+
+    if args.benchmark:
+        return _run_benchmark(beams, params, quiet=args.quiet)
 
     if args.dry_run:
         chunk_samps = int(round(args.chunk_sec / tsamp))
