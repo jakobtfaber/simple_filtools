@@ -4,6 +4,9 @@
 #   make              # builds rfidiag
 #   make test         # builds + runs unit and end-to-end tests (needs python+numpy)
 #   make clean
+#   make install-hooks    # pre-commit: sync CLAUDE.md Agent skills block from AGENTS.md
+#   make sync-agents      # same sync on demand
+#   make check-agent-sync # exit 1 if CLAUDE.md drifts (CI-friendly)
 
 CC      ?= cc
 LDLIBS  ?= -lm
@@ -30,7 +33,7 @@ BINS    := rfidiag chop_fil header
 
 PYTHON  ?= python3
 
-.PHONY: all clean test test-unpack test-numpy
+.PHONY: all clean test test-unpack test-numpy install-hooks sync-agents check-agent-sync
 
 all: $(BINS)
 
@@ -61,3 +64,14 @@ test: test-unpack test-numpy
 clean:
 	rm -f $(OBJ) $(BINS) tests/test_unpack
 	rm -rf tests/_tmp
+
+# Copy tracked hook into .git/hooks (once per clone).
+install-hooks:
+	cp scripts/git-hooks/pre-commit .git/hooks/pre-commit
+	chmod +x .git/hooks/pre-commit scripts/sync_agent_skills.py
+
+sync-agents:
+	$(PYTHON) scripts/sync_agent_skills.py
+
+check-agent-sync:
+	$(PYTHON) scripts/sync_agent_skills.py --check
