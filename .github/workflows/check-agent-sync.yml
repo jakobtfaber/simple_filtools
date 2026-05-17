@@ -1,0 +1,17 @@
+# Ensures CLAUDE.md matches AGENTS.md from "## Agent skills" through EOF
+# (canonical block injected into CLAUDE.md's agent-skills <important> wrapper).
+name: Check agent-docs sync
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  sync-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify AGENTS.md ↔ CLAUDE.md Agent skills mirror
+        run: python3 scripts/sync_agent_skills.py --check
