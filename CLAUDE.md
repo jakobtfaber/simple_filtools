@@ -42,7 +42,7 @@ Python deps for tests/plotting: see `python/requirements.txt` (numpy; matplotlib
 <important if="you are configuring agent harness, skills, GitHub workflow, domain docs pointers, or AI coding vocabulary">
 ## Agent skills
 
-### Issue tracker
+### Issue tracker _(deliberate CI drift — do not merge)_
 
 Issues use GitHub (`dsa110/simple_filtools`); use `gh` per `docs/agents/issue-tracker.md`.
 
