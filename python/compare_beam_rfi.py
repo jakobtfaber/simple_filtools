@@ -415,15 +415,13 @@ def correlation_matrix(zdms: List["ZdmStats"]) -> np.ndarray:
 
 
 def find_coincident_bursts(zdms: List["ZdmStats"], sigma: float):
-    """Group time bins where any beam exceeds +sigma into contiguous events.
-
-    Returns a list of dicts with:
-        t0, t1     -- start/stop time (s) of the run
-        nbins      -- run length in bins
-        n_beams    -- # beams crossing the threshold somewhere in the run
-        beam_max   -- (nbeams,) peak z within the run, per beam
-        beams_hit  -- list of beam names that crossed threshold
-    """
+    """Group time bins where any beam exceeds +sigma into contiguous burst events."""
+    # Each returned dict carries:
+    #   t0, t1     -- start/stop time (s) of the run
+    #   nbins      -- run length in bins
+    #   n_beams    -- # beams crossing the threshold somewhere in the run
+    #   beam_max   -- (nbeams,) peak z within the run, per beam
+    #   beams_hit  -- list of beam names that crossed threshold
     if not zdms:
         return []
     n = _truncate_to_min(zdms)
@@ -605,15 +603,12 @@ def _per_beam_noise_level(beams: List[BeamStats]) -> np.ndarray:
 
 def analyse_spatial_feasibility(beams: List[BeamStats],
                                 whiten: bool = True) -> SpatialStats:
-    """Per-channel SVD of cross-beam chunk-mean intensities, plus PCA
-    of the cross-beam zero-DM time series.
-
-    For each channel c:
-        M = (CMEA[:, :, c] - mean_over_chunks_per_beam)            (p x N)
-        if whiten: M /= rms_over_chunks_per_beam                   (per-beam)
-        eigenvalues of (M @ M.T) / nchunks                         (p,)
-        rank_k_residual[k] = (sum of eigvals[k:]) / sum(eigvals)
-    """
+    """Per-channel SVD of cross-beam chunk-mean intensities, plus PCA of cross-beam zero-DM."""
+    # Per channel c, with p = nbeams and N = nchunks:
+    #   M = CMEA[:, :, c] - mean_over_chunks_per_beam              (p x N)
+    #   if whiten: M /= rms_over_chunks_per_beam                   (per-beam)
+    #   eigvals(M @ M.T / nchunks)                                 (p,)
+    #   rank_k_residual[k] = sum(eigvals[k:]) / sum(eigvals)
     nbeams = len(beams)
     cube = _stack_chunk_means(beams)            # (nbeams, nchunks, nchans)
     nch_eff = cube.shape[1]
