@@ -70,8 +70,19 @@ install-hooks:
 	cp scripts/git-hooks/pre-commit .git/hooks/pre-commit
 	chmod +x .git/hooks/pre-commit scripts/sync_agent_skills.py
 
+# Prefer global agent-docs-sync when available on PATH or at ~/.local/bin/agent-docs-sync
+AGENT_DOCS_SYNC := $(shell command -v agent-docs-sync 2>/dev/null || (test -x $(HOME)/.local/bin/agent-docs-sync && echo $(HOME)/.local/bin/agent-docs-sync) || echo "")
+
 sync-agents:
+ifneq ($(AGENT_DOCS_SYNC),)
+	$(AGENT_DOCS_SYNC) sync --repo "$(CURDIR)"
+else
 	$(PYTHON) scripts/sync_agent_skills.py
+endif
 
 check-agent-sync:
+ifneq ($(AGENT_DOCS_SYNC),)
+	$(AGENT_DOCS_SYNC) check --repo "$(CURDIR)"
+else
 	$(PYTHON) scripts/sync_agent_skills.py --check
+endif

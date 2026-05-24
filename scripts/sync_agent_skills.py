@@ -71,6 +71,28 @@ def main() -> int:
     args = parser.parse_args()
 
     root = repo_root()
+
+    # Look for global agent-docs-sync tool
+    import os
+    import shutil
+    global_bin = None
+    if shutil.which("agent-docs-sync"):
+        global_bin = "agent-docs-sync"
+    else:
+        fallback = Path.home() / ".local" / "bin" / "agent-docs-sync"
+        if fallback.is_file() and os.access(fallback, os.X_OK):
+            global_bin = str(fallback)
+
+    if global_bin:
+        cmd = [global_bin, "check" if args.check else "sync", "--repo", str(root)]
+        if not args.check and args.stage:
+            cmd.append("--stage")
+        try:
+            res = subprocess.run(cmd)
+            return res.returncode
+        except Exception as e:
+            print(f"sync_agent_skills: delegation failed ({e}), falling back to local logic", file=sys.stderr)
+
     agents_path = root / "AGENTS.md"
     claude_path = root / "CLAUDE.md"
 
