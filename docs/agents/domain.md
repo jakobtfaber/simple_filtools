@@ -62,6 +62,17 @@ When using `graphify-out/graph.json` for navigation or refactor planning, know t
 
 ## Graphify hygiene
 
-- `.graphifyignore` lives at the repo root (gitignore syntax). It excludes `.cursor/`, `.claude/`, `.remember/`, `graphify-out/`, Makefile outputs, and Python caches from extraction.
-- Rebuild: `graphify update <repo-root>`. If you've added new ignore patterns but the graph hasn't shrunk, the topology-equality short-circuit (`graphify/watch.py::487`) is suppressing the rewrite — remove `graphify-out/graph.json` and re-run `update` to force a clean regenerate.
-- The Gemini ban (see `AGENTS.md` Learned User Preferences) is operationally enforced by `cost.json`: every rebuild must keep `runs[-1].input_tokens == 0` and `output_tokens == 0`. Any nonzero value means a key leaked into the env.
+- `.graphifyignore` lives at the repo root (gitignore syntax). It excludes `.cursor/`, `.claude/`, `.remember/`, `supertool` (no repo-local symlink — use global `~/.local/bin/supertool` on `$PATH`), `graphify-out/`, Makefile outputs, and Python caches from extraction.
+- **AST-only rebuild (default):** `graphify update <repo-root>`. No LLM; safe when Gemini keys are unset. If you've added new ignore patterns but the graph hasn't shrunk, the topology-equality short-circuit (`graphify/watch.py::487`) is suppressing the rewrite — remove `graphify-out/graph.json` and re-run `update` to force a clean regenerate.
+- **Approved local semantic (Ollama):** Homebrew **`ollama`** (chezmoi-managed in **`~/.Brewfile`** → `home/dot_Brewfile.tmpl`). Binary **`/opt/homebrew/bin/ollama`**; weights **`~/.ollama/models/`** (blobs + manifests). Default Graphify model: **`qwen2.5-coder:7b`** (`OLLAMA_MODEL` override). Pull once: `ollama pull qwen2.5-coder:7b`.
+- **Semantic extract recipe** (from repo root; unset cloud keys so auto-detect cannot pick Gemini):
+
+```bash
+env -u GEMINI_API_KEY -u GOOGLE_API_KEY -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u MOONSHOT_API_KEY \
+  OLLAMA_BASE_URL=http://localhost:11434/v1 OLLAMA_MODEL=qwen2.5-coder:7b \
+  graphify extract . --backend ollama --max-concurrency 1 --api-timeout 900
+graphify cluster-only .
+```
+
+  Use **`--max-concurrency 1`** on local LLMs. First inference after idle can take ~30–60s (model load). For a full semantic rebuild, delete `graphify-out/graph.json` before `extract`. Token counts appear in the extract log; **`cost.json`** stays at 0 for AST-only runs and is **not** the Ollama token ledger.
+- The Gemini ban (see `AGENTS.md` Learned User Preferences) is operationally enforced for **cloud** paths by **`cost.json`**: AST rebuilds must keep `runs[-1].input_tokens == 0` and `output_tokens == 0`. Any nonzero value with Gemini keys present means a key leaked into the env. **Ollama semantic is explicitly allowed** and does not use Gemini.

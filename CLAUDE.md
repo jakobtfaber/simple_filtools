@@ -9,7 +9,7 @@ Standalone C + Python utilities for **SIGPROC filterbank** (`.fil`) data: stream
 - `python/tools/` — synthetic `.fil` generator (`make_test_fil.py`), multibeam smoke test (`test_multibeam_clean.py`)
 - `tests/` — unpack C tests (`test_unpack.c`), numpy parity vs `rfidiag` (`check_against_numpy.py`)
 - `docs/agents/` — issue tracker, triage, domain rules, AI coding vocabulary bridge (`AGENTS.md` mirrors **`## Agent skills`** here — keep in sync)
-- **`graphify-out/`** — project graph artifacts; **do not** configure Graphify with Gemini (**leave `GEMINI_API_KEY` / `GOOGLE_API_KEY` unset**; no `backend="gemini"`). Prefer AST + agent-driven workflows; details in **`AGENTS.md`** **Learned User Preferences**.
+- **`graphify-out/`** — project graph artifacts; **do not** configure Graphify with Gemini (**leave `GEMINI_API_KEY` / `GOOGLE_API_KEY` unset**; no `backend="gemini"`). AST default: `graphify update .`. Approved local semantic: **Ollama** (`graphify extract . --backend ollama --max-concurrency 1`) — see **`docs/agents/domain.md`** and **`AGENTS.md`** Learned Workspace Facts.
 - Upstream semantics: canonical org repo is **`dsa110/simple_filtools`**; personal work often uses a **fork** (`origin` → your fork, `upstream` → `dsa110`) — confirm with `git remote -v`.
 
 <important if="you need to run commands to build, test, lint, or generate code">
@@ -34,6 +34,8 @@ From repo root (`PYTHON` defaults to `python3` in the Makefile).
 | `python3 scripts/sync_agent_skills.py` | Copy **`AGENTS.md`** **`## Agent skills`** into **`CLAUDE.md`** agent-skills block (canonical → mirror) |
 | `python3 scripts/sync_agent_skills.py --check` | Exit non-zero if **`CLAUDE.md`** drifts (for CI) |
 | `make install-hooks` | Install **`pre-commit`** hook that runs **`sync_agent_skills.py --stage`** |
+| `graphify update .` | AST-only graph rebuild (no LLM; default for code changes) |
+| `graphify extract . --backend ollama --max-concurrency 1` | Local semantic extract via Homebrew Ollama; then `graphify cluster-only .` — see domain docs |
 
 Python deps for tests/plotting: see `python/requirements.txt` (numpy; matplotlib for plots).
 
@@ -61,6 +63,23 @@ Shared jargon for AI-assisted development (handoffs, skills, AFK, attention budg
 ---
 
 **Maintainer sync (`AGENTS.md` ↔ `CLAUDE.md`):** **`AGENTS.md`** is canonical for **`## Agent skills`** (Issue tracker through this paragraph). The same block must appear **verbatim** in **`CLAUDE.md`** inside `<important if="you are configuring agent harness, skills, GitHub workflow, domain docs pointers, or AI coding vocabulary">`. Edit **`AGENTS.md`** first; run **`python3 scripts/sync_agent_skills.py`** to rewrite **`CLAUDE.md`**, or install **`make install-hooks`** so **`pre-commit`** runs that sync (**`--stage`**) every commit.
+
+</important>
+
+<important if="you are rebuilding graphify-out or running semantic graph extraction">
+
+- **No Gemini:** leave **`GEMINI_API_KEY`** / **`GOOGLE_API_KEY`** unset; never `backend="gemini"`.
+- **Ollama (approved local semantic):** Homebrew **`/opt/homebrew/bin/ollama`** (chezmoi **`~/.Brewfile`**); models **`~/.ollama/models/`**; default **`qwen2.5-coder:7b`**. Unset cloud API keys, then:
+
+```bash
+env -u GEMINI_API_KEY -u GOOGLE_API_KEY -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u MOONSHOT_API_KEY \
+  OLLAMA_BASE_URL=http://localhost:11434/v1 OLLAMA_MODEL=qwen2.5-coder:7b \
+  graphify extract . --backend ollama --max-concurrency 1 --api-timeout 900
+graphify cluster-only .
+```
+
+- **AST-only (no semantic):** `graphify update .` — use for routine code edits; keeps cloud tokens at zero in **`cost.json`**.
+- Caveats and graph navigation: **`docs/agents/domain.md`** (Graphify hygiene + graph caveats).
 
 </important>
 
