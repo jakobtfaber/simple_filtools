@@ -68,3 +68,13 @@ venv/
 .DS_Store
 .idea/
 .vscode/
+
+# Local editor/agent config
+.cursor/
+# Local graphify/code-indexing artifacts
+.graphifyignore
+graphify-out/
+# Generated test scratch output
+tests/_tmp/
+# Compiled test executable
+tests/test_unpack
